@@ -15,7 +15,6 @@ command -v sshpass >/dev/null 2>&1 || {
 # ---------------- Configuration ----------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODES_FILE="${SCRIPT_DIR}/nodes"
-SSH_PORT="22"
 SSH_KEY_TYPE="auto"  # Set to "auto" for automatic detection, or specify: ed25519, rsa, ecdsa
 RSA_KEY_BITS="4096"  # RSA key length for enhanced security (2048/3072/4096)
 
@@ -23,9 +22,6 @@ RSA_KEY_BITS="4096"  # RSA key length for enhanced security (2048/3072/4096)
 ALL_KEYS_TEMP=$(mktemp /tmp/ssh_keys.XXXXXX)
 KNOWN_HOSTS_TEMP=$(mktemp /tmp/ssh_hosts.XXXXXX)
 VERIFY_LOG=$(mktemp /tmp/ssh_verify.XXXXXX)
-
-# SSH default options
-SSH_OPTS="-q -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
 
 # Color definitions - semantic naming for better maintainability
 ERROR_COLOR='\033[0;91m'      # Bright red/orange - for errors and failures
@@ -160,14 +156,42 @@ fi
 echo -e "${INFO_COLOR}Loaded ${NUM_NODES} node(s) from configuration file${NC}"
 echo ""
 
-# ---------------- Safety Password Input ----------------
+# ---------------- Interactive Input for Username and Port ----------------
 echo ""
-read -p "Enter SSH Username: " SSH_USER
-if [ -z "$SSH_USER" ]; then
-    echo -e "${ERROR_COLOR}ERROR: Username cannot be empty${NC}"
+# Username input with default value
+read -p "Enter SSH Username [default: root]: " SSH_USER
+SSH_USER="${SSH_USER:-root}"
+
+# Port input with default value
+read -p "Enter SSH Port [default: 22]: " SSH_PORT
+SSH_PORT="${SSH_PORT:-22}"
+
+# Validate port number
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt 65535 ]; then
+    echo -e "${ERROR_COLOR}ERROR: Invalid port number. Must be between 1-65535${NC}"
     exit 1
 fi
 
+# SSH default options (using the custom port)
+SSH_OPTS="-q -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
+
+# ---------------- Dry-run Mode ----------------
+echo ""
+read -p "Run in dry-run mode? (y=preview only, n=execute changes) [default: n]: " DRY_RUN_INPUT
+DRY_RUN_INPUT=$(echo "$DRY_RUN_INPUT" | tr '[:upper:]' '[:lower:]')
+
+if [[ "$DRY_RUN_INPUT" =~ ^(y|yes)$ ]]; then
+    DRY_RUN=true
+    echo -e "${WARNING_COLOR}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${WARNING_COLOR}DRY-RUN MODE ENABLED${NC}"
+    echo -e "${WARNING_COLOR}No changes will be made to any nodes${NC}"
+    echo -e "${WARNING_COLOR}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+else
+    DRY_RUN=false
+fi
+
+# ---------------- Safety Password Input ----------------
+echo ""
 while true; do
     read -rs -p "Enter Password for $SSH_USER: " PASS1; echo
     read -rs -p "Confirm Password: " PASS2; echo
@@ -193,7 +217,104 @@ else
     echo -e "  Key Type: ${INFO_COLOR}$SSH_KEY_TYPE${NC}"
 fi
 echo -e "  Total Paths: ${INFO_COLOR}$((NUM_NODES * (NUM_NODES - 1)))${NC}"
+if [ "$DRY_RUN" = true ]; then
+    echo -e "  Mode: ${WARNING_COLOR}DRY-RUN (Preview Only)${NC}"
+else
+    echo -e "  Mode: ${SUCCESS_COLOR}LIVE (Making Changes)${NC}"
+fi
 echo ""
+
+# ---------------- Dry-run Detailed Preview ----------------
+if [ "$DRY_RUN" = true ]; then
+    # Prepare KEYSCAN_TYPES for preview
+    if [ "$SSH_KEY_TYPE" = "rsa" ]; then
+        KEYSCAN_TYPES_PREVIEW="rsa"
+    else
+        KEYSCAN_TYPES_PREVIEW="rsa,$SSH_KEY_TYPE"
+    fi
+    
+    print_header "DRY-RUN: Preview of Operations"
+    
+    echo -e "${INFO_COLOR}Step 1: Key Generation${NC}"
+    echo "  Will attempt to generate SSH keys on $NUM_NODES nodes"
+    echo ""
+    
+    echo -e "${INFO_COLOR}Step 2: Key Collection${NC}"
+    echo "  Will collect public keys from ~/.ssh/id_$SSH_KEY_TYPE.pub on each node"
+    echo ""
+    
+    echo -e "${INFO_COLOR}Step 3: Fingerprint Scanning${NC}"
+    echo "  Will scan SSH fingerprints using: ssh-keyscan -p $SSH_PORT -t $KEYSCAN_TYPES_PREVIEW"
+    echo ""
+    
+    echo -e "${INFO_COLOR}Step 4: Key Distribution${NC}"
+    echo "  Will distribute collected keys to all nodes:"
+    echo "    - Update ~/.ssh/authorized_keys (merge, deduplicate)"
+    echo "    - Update ~/.ssh/known_hosts (merge, deduplicate)"
+    echo "    - Set permissions: ~/.ssh (700), authorized_keys (600), known_hosts (644)"
+    echo ""
+    
+    echo -e "${INFO_COLOR}Step 5: Verification${NC}"
+    echo "  Will test $((NUM_NODES * (NUM_NODES - 1))) passwordless SSH connections (full mesh)"
+    echo ""
+    
+    print_header "DRY-RUN: Connectivity Test"
+    echo -e "  Testing basic SSH connectivity to all nodes..."
+    echo -n "  Progress: "
+    
+    REACHABLE_NODES=()
+    UNREACHABLE_NODES=()
+    
+    for node in "${NODES[@]}"; do
+        if sshpass -e ssh -q -p "$SSH_PORT" \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=5 \
+              "$SSH_USER@$node" "echo 'OK'" >/dev/null 2>&1; then
+            echo -n "."
+            REACHABLE_NODES+=("$node")
+        else
+            echo -n "x"
+            UNREACHABLE_NODES+=("$node")
+        fi
+    done
+    
+    echo " Done"
+    echo ""
+    print_header "DRY-RUN: Summary"
+    echo -e "  Total Nodes:      ${INFO_COLOR}$NUM_NODES${NC}"
+    echo -e "  Reachable:        ${SUCCESS_COLOR}${#REACHABLE_NODES[@]}${NC}"
+    echo -e "  Unreachable:      ${ERROR_COLOR}${#UNREACHABLE_NODES[@]}${NC}"
+    
+    if [ ${#UNREACHABLE_NODES[@]} -gt 0 ]; then
+        echo ""
+        echo -e "${ERROR_COLOR}Unreachable nodes:${NC}"
+        for node in "${UNREACHABLE_NODES[@]}"; do
+            echo -e "  ${ERROR_COLOR}✗${NC} $node"
+        done
+        echo ""
+        echo -e "${WARNING_COLOR}Please verify these issues before running in live mode:${NC}"
+        echo "  1. Network connectivity"
+        echo "  2. SSH service status (systemctl status sshd)"
+        echo "  3. Correct username and password"
+        echo "  4. Correct SSH port"
+        echo "  5. Firewall rules (allow port $SSH_PORT)"
+    fi
+    
+    echo ""
+    echo -e "${SUCCESS_COLOR}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${SUCCESS_COLOR}DRY-RUN COMPLETED${NC}"
+    echo -e "${SUCCESS_COLOR}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    if [ ${#REACHABLE_NODES[@]} -eq $NUM_NODES ]; then
+        echo -e "All nodes are reachable. You can now run the script without dry-run mode."
+    else
+        echo -e "Some nodes are unreachable. Please fix the issues before proceeding."
+    fi
+    
+    echo ""
+    exit 0
+fi
 
 # ---------------- Step 1: Key Generation ----------------
 print_step "1/5" "Generating SSH keys on all nodes..."
@@ -273,6 +394,7 @@ if [ ${#FAILED_NODES[@]} -gt 0 ]; then
     echo "  2. SSH service is running (systemctl status sshd)"
     echo "  3. Password is correct for user '$SSH_USER'"
     echo "  4. User has proper permissions"
+    echo "  5. Port $SSH_PORT is correct and accessible"
     exit 1
 fi
 
@@ -533,14 +655,15 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
     echo "   - PubkeyAuthentication yes"
     echo "   - AuthorizedKeysFile .ssh/authorized_keys"
     echo "   - PermitRootLogin (if using root)"
+    echo "   - Port $SSH_PORT"
     echo "   After changes: systemctl restart sshd"
     echo ""
     echo "3. SELinux (if enabled):"
     echo "   - restorecon -R -v ~/.ssh"
     echo ""
     echo "4. Manual Test:"
-    echo "   - ssh $SSH_USER@<source-host>"
-    echo "   - ssh -vvv $SSH_USER@<destination-host>"
+    echo "   - ssh -p $SSH_PORT $SSH_USER@<source-host>"
+    echo "   - ssh -p $SSH_PORT -vvv $SSH_USER@<destination-host>"
     echo ""
     echo "5. Check Logs:"
     echo "   - tail -f /var/log/secure (on destination)"
@@ -559,9 +682,16 @@ else
     fi
     echo ""
     echo -e "${INFO_COLOR}Example usage:${NC}"
-    echo -e "  ssh $SSH_USER@${NODES[0]}"
-    if [ "$NUM_NODES" -gt 1 ]; then
-        echo -e "  ssh $SSH_USER@${NODES[1]}"
+    if [ "$SSH_PORT" != "22" ]; then
+        echo -e "  ssh -p $SSH_PORT $SSH_USER@${NODES[0]}"
+        if [ "$NUM_NODES" -gt 1 ]; then
+            echo -e "  ssh -p $SSH_PORT $SSH_USER@${NODES[1]}"
+        fi
+    else
+        echo -e "  ssh $SSH_USER@${NODES[0]}"
+        if [ "$NUM_NODES" -gt 1 ]; then
+            echo -e "  ssh $SSH_USER@${NODES[1]}"
+        fi
     fi
     echo -e "${SUCCESS_COLOR}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     exit 0
